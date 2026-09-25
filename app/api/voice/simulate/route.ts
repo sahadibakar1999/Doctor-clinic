@@ -12,18 +12,67 @@ import { GoogleGenAI, Type } from "@google/genai";
 
 export const dynamic = "force-dynamic";
 
+// Helper to extract patient name from dialogue
+function extractPatientName(text: string): string | null {
+  const patterns = [
+    /(?:book for|appointment for|patient is|patient name is|patient:?\s*)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)/i,
+    /(?:my name is|i am|this is)\s+([a-zA-Z]+(?:\s+[a-zA-Z]+)?)/i,
+    /(?:for\s+)([a-zA-Z]+(?:\s+[a-zA-Z]+)?)/i,
+  ];
+  for (const p of patterns) {
+    const match = text.match(p);
+    if (match && match[1]) {
+      const candidate = match[1].trim();
+      const lowerCandidate = candidate.toLowerCase();
+      if (
+        ![
+          "tomorrow",
+          "today",
+          "a test",
+          "the test",
+          "kidney",
+          "blood",
+          "morning",
+          "afternoon",
+          "fbs",
+          "fasting",
+          "lipid",
+        ].includes(lowerCandidate)
+      ) {
+        return candidate
+          .split(" ")
+          .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+          .join(" ");
+      }
+    }
+  }
+  return null;
+}
+
+// Helper to extract 10-digit mobile number
+function extractPhoneNumber(text: string): string | null {
+  const match = text.match(/(?:\+?91[\s-]?)?([6-9]\d{4}[\s-]?\d{5}|\b\d{10}\b)/);
+  if (match && match[1]) {
+    const clean = match[1].replace(/\D/g, "");
+    if (clean.length === 10) {
+      return `+91 ${clean.slice(0, 5)} ${clean.slice(5)}`;
+    }
+  }
+  return null;
+}
+
 // Gemini Tool Definitions
 const geminiTools = [
   {
     name: "check_test_prep",
     description:
-      "Look up preparation guidelines, price, fasting hours, and requirements for a medical lab test (e.g. Vitamin D, Lipid Profile, Fasting Blood Sugar, Thyroid, CBC, Ultrasound, LFT, KFT). Call this whenever a patient asks about or mentions any diagnostic test.",
+      "Look up preparation guidelines, price, fasting hours, and requirements for a medical lab test (e.g. Kidney Function Test, Vitamin D, Lipid Profile, Fasting Blood Sugar, Thyroid, CBC, Ultrasound, LFT). Call this whenever a patient asks about or mentions any diagnostic test.",
     parameters: {
       type: Type.OBJECT,
       properties: {
         test_name: {
           type: Type.STRING,
-          description: "The name of the medical test, e.g. 'Vitamin D', 'Lipid Profile', 'Fasting Blood Sugar', etc.",
+          description: "The name of the medical test, e.g. 'Kidney Function Test', 'Lipid Profile', 'Fasting Blood Sugar', etc.",
         },
       },
       required: ["test_name"],
@@ -47,17 +96,17 @@ const geminiTools = [
   {
     name: "book_lab_appointment",
     description:
-      "Book an appointment for a patient for a specific diagnostic test and time slot. Calculates and reports fasting cutoff times automatically.",
+      "Book an appointment for a patient. CRITICAL: You MUST only call this function when you have collected ALL 4 required fields: test_name, time_slot, patient_name, and patient_phone. If the patient's phone number or name is missing, you must ask the patient for it instead of calling this function.",
     parameters: {
       type: Type.OBJECT,
       properties: {
         test_name: {
           type: Type.STRING,
-          description: "Name of the diagnostic test to book (e.g. 'Lipid Profile', 'Fasting Blood Sugar (FBS)', 'Vitamin D3', etc.)",
+          description: "Name of the diagnostic test to book (e.g. 'Kidney Function Test (KFT/RFT)', 'Lipid Profile', etc.)",
         },
         time_slot: {
           type: Type.STRING,
-          description: "The chosen time slot, e.g. '08:30 AM', '07:30 AM', '09:00 AM'",
+          description: "The chosen time slot, e.g. '09:00 AM', '08:30 AM', '07:30 AM'",
         },
         date: {
           type: Type.STRING,
@@ -65,14 +114,14 @@ const geminiTools = [
         },
         patient_name: {
           type: Type.STRING,
-          description: "Patient's full name, default to 'Patient' if not specified",
+          description: "The patient's actual full name as given in the conversation (e.g. 'Govind Pandey'). NEVER use 'Patient' if the patient provided their name.",
         },
         patient_phone: {
           type: Type.STRING,
-          description: "Patient's phone number, default to '+91 98200 45678' if not specified",
+          description: "The patient's 10-digit mobile number.",
         },
       },
-      required: ["test_name", "time_slot"],
+      required: ["test_name", "time_slot", "patient_name", "patient_phone"],
     },
   },
   {
@@ -112,6 +161,30 @@ export async function POST(req: NextRequest) {
       );
     }
 
+    // Extract any existing patient name & phone from all history + current message
+    let collectedPatientName = "";
+    let collectedPatientPhone = "";
+
+    // Check current message first
+    collectedPatientName = extractPatientName(userMessage) || "";
+    collectedPatientPhone = extractPhoneNumber(userMessage) || "";
+
+    // Then search through conversation history
+    for (const turn of conversationHistory) {
+      if (!collectedPatientName && turn.text) {
+        collectedPatientName = extractPatientName(turn.text) || "";
+      }
+      if (!collectedPatientPhone && turn.text) {
+        collectedPatientPhone = extractPhoneNumber(turn.text) || "";
+      }
+      if (turn.toolCall?.args?.patient_name && turn.toolCall.args.patient_name !== "Patient") {
+        collectedPatientName = turn.toolCall.args.patient_name;
+      }
+      if (turn.toolCall?.args?.patient_phone) {
+        collectedPatientPhone = turn.toolCall.args.patient_phone;
+      }
+    }
+
     const apiKey = process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
 
     // -------------------------------------------------------------
@@ -122,7 +195,6 @@ export async function POST(req: NextRequest) {
         const ai = new GoogleGenAI({ apiKey });
         const contents: any[] = [];
 
-        // Add history turns (excluding any initial greetings if empty)
         for (const turn of conversationHistory) {
           if (turn.text) {
             contents.push({
@@ -132,34 +204,47 @@ export async function POST(req: NextRequest) {
           }
         }
 
-        // Add latest user message
         contents.push({
           role: "user",
           parts: [{ text: userMessage }],
         });
 
+        const systemInstruction =
+          "You are Ananya, an empathetic, highly professional medical receptionist at Apex Diagnostic Centre.\n" +
+          "Clinical Booking Protocol:\n" +
+          "1. Test Inquiries: Answer questions about tests, pricing, and fasting instructions (plain water allowed, tea/coffee prohibited for fasting tests) using check_test_prep.\n" +
+          "2. Available Times: When a patient asks about available times or wants to book, call get_available_slots to offer 2 available slots.\n" +
+          "3. Mandatory Patient Details Collection:\n" +
+          "   - Remember the patient's full name throughout the conversation (e.g. if caller said 'i want to book for govind pandey', their name is 'Govind Pandey').\n" +
+          "   - When a slot is selected, check if you have their 10-digit mobile number.\n" +
+          "   - If you know their name (e.g. Govind Pandey) but NOT their phone number, ask: 'Great! Could you please share your 10-digit mobile number so I can confirm the booking and send reminder details?'\n" +
+          "   - If you do not have their name either, ask: 'Could you please share your full name and 10-digit mobile number to complete the booking?'\n" +
+          "   - DO NOT call book_lab_appointment without the patient's mobile number and name. Ask for them first!\n" +
+          "4. Booking Execution: ONLY call book_lab_appointment once you have the test_name, time_slot, patient_name, and patient_phone.\n" +
+          "5. Keep responses concise, polite, and reassuring (1 to 2 short sentences max) suitable for voice delivery." +
+          (collectedPatientName ? `\nNote: The patient's name already identified in this conversation is: ${collectedPatientName}.` : "");
+
         const geminiResponse = await ai.models.generateContent({
           model: process.env.GEMINI_MODEL || "gemini-3.5-flash-lite",
           contents,
           config: {
-            systemInstruction:
-              "You are Ananya, an empathetic, highly professional medical receptionist at Apex Diagnostic Centre.\n" +
-              "Your primary role is patient assistance:\n" +
-              "1. Answer questions about diagnostic lab tests and preparation (especially fasting requirements, water/tea rules, price).\n" +
-              "2. Check available appointment time slots when asked.\n" +
-              "3. When a patient chooses a time slot (like '8:30 am' or 'the first one') or asks to book, call book_lab_appointment immediately with the test discussed.\n" +
-              "4. When a patient mentions a test (like 'vitamin D', 'lipid profile', 'FBS'), call check_test_prep to look up their prep instructions.\n" +
-              "5. Keep responses concise, polite, and reassuring (1 to 2 short sentences max) suitable for clear voice delivery.\n" +
-              "Always use the provided tools to fetch real data and book appointments.",
+            systemInstruction,
             tools: [{ functionDeclarations: geminiTools as any }],
           },
         });
 
-        // Check if Gemini invoked a function call
         if (geminiResponse.functionCalls && geminiResponse.functionCalls.length > 0) {
           const fnCall = geminiResponse.functionCalls[0];
           const fnName = fnCall.name;
           const fnArgs = (fnCall.args || {}) as any;
+
+          // Override name/phone if collected from history and missing in tool args
+          if (collectedPatientName && (!fnArgs.patient_name || fnArgs.patient_name === "Patient")) {
+            fnArgs.patient_name = collectedPatientName;
+          }
+          if (collectedPatientPhone && !fnArgs.patient_phone) {
+            fnArgs.patient_phone = collectedPatientPhone;
+          }
 
           let toolResult: any = null;
           let detectedIntent = "OTHER";
@@ -172,17 +257,17 @@ export async function POST(req: NextRequest) {
             detectedIntent = "BOOKING";
           } else if (fnName === "book_lab_appointment") {
             toolResult = await bookLabAppointment({
-              patient_name: fnArgs.patient_name || "Patient",
-              patient_phone: fnArgs.patient_phone || "+91 98200 " + Math.floor(10000 + Math.random() * 90000),
-              test_name: fnArgs.test_name || "Fasting Blood Sugar (FBS)",
+              patient_name: fnArgs.patient_name || collectedPatientName || "Patient",
+              patient_phone: fnArgs.patient_phone || collectedPatientPhone || "+91 98000 00000",
+              test_name: fnArgs.test_name || "Kidney Function Test (KFT/RFT)",
               date: fnArgs.date || "tomorrow",
-              time_slot: fnArgs.time_slot || "08:30 AM",
+              time_slot: fnArgs.time_slot || "09:00 AM",
             });
             detectedIntent = "BOOKING";
           } else if (fnName === "confirm_fasting_readiness") {
             toolResult = await confirmFastingReadiness({
-              patient_name: fnArgs.patient_name,
-              patient_phone: fnArgs.patient_phone,
+              patient_name: fnArgs.patient_name || collectedPatientName,
+              patient_phone: fnArgs.patient_phone || collectedPatientPhone,
             });
             detectedIntent = "PREP_QUERY";
           }
@@ -200,7 +285,6 @@ export async function POST(req: NextRequest) {
           });
         }
 
-        // Pure text response from Gemini (greetings, general chat, clarifying questions)
         const textResponse = geminiResponse.text?.trim() || "";
         if (textResponse) {
           return NextResponse.json({
@@ -217,7 +301,6 @@ export async function POST(req: NextRequest) {
         }
       } catch (geminiError: any) {
         console.error("Gemini API error, falling back to local engine:", geminiError);
-        // Continue to local fallback below
       }
     }
 
@@ -226,13 +309,11 @@ export async function POST(req: NextRequest) {
     // -------------------------------------------------------------
     const lower = userMessage.toLowerCase();
 
-    // 1. Extract context from conversation history
     let contextTestName = "";
     let contextDate = "tomorrow";
     let lastOfferedSlots: string[] = [];
     let lastAiText = "";
     let lastToolName = "";
-    let contextPatientName = "";
 
     for (let i = conversationHistory.length - 1; i >= 0; i--) {
       const item = conversationHistory[i];
@@ -279,12 +360,6 @@ export async function POST(req: NextRequest) {
           contextTestName = "Vitamin D3 (25-Hydroxy)";
         }
       }
-      if (!contextPatientName && item.text) {
-        const nameMatch = item.text.match(/(?:my name is|i am|for\s+)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
-        if (nameMatch && nameMatch[1]) {
-          contextPatientName = nameMatch[1].trim();
-        }
-      }
     }
 
     if (lastOfferedSlots.length === 0 && lastAiText) {
@@ -292,12 +367,6 @@ export async function POST(req: NextRequest) {
       if (matches && matches.length > 0) {
         lastOfferedSlots = matches;
       }
-    }
-
-    let patientName = contextPatientName || "Patient";
-    const currentNameMatch = userMessage.match(/(?:my name is|i am|for\s+)([A-Z][a-z]+(?:\s+[A-Z][a-z]+)?)/i);
-    if (currentNameMatch && currentNameMatch[1]) {
-      patientName = currentNameMatch[1].trim();
     }
 
     let dateStr = contextDate;
@@ -334,7 +403,9 @@ export async function POST(req: NextRequest) {
       }
     }
     if (!testDetectedInMessage) {
-      if (lower.includes("vitamin d") || lower.includes("vit d") || lower.includes("vitamin")) {
+      if (lower.includes("kidney") || lower.includes("kft") || lower.includes("rft")) {
+        testDetectedInMessage = "Kidney Function Test (KFT/RFT)";
+      } else if (lower.includes("vitamin d") || lower.includes("vit d") || lower.includes("vitamin")) {
         testDetectedInMessage = "Vitamin D3 (25-Hydroxy)";
       } else if (lower.includes("lipid") || lower.includes("cholesterol")) {
         testDetectedInMessage = "Lipid Profile";
@@ -348,8 +419,6 @@ export async function POST(req: NextRequest) {
         testDetectedInMessage = "Complete Blood Count (CBC)";
       } else if (lower.includes("liver") || lower.includes("lft")) {
         testDetectedInMessage = "Liver Function Test (LFT)";
-      } else if (lower.includes("kidney") || lower.includes("kft")) {
-        testDetectedInMessage = "Kidney Function Test (KFT/RFT)";
       }
     }
 
@@ -365,43 +434,51 @@ export async function POST(req: NextRequest) {
       lastAiText.toLowerCase().includes("available on") ||
       lastOfferedSlots.length > 0;
 
-    // 1. Fasting confirmation
-    if (
-      lower.includes("confirm fasting") ||
-      lower.includes("yes i am fasting") ||
-      lower.includes("started fasting") ||
-      lower.includes("i have fasted") ||
-      lower.includes("stopped eating") ||
-      (lower.includes("fasting") && (lower.includes("yes") || lower.includes("confirm")))
-    ) {
-      detectedIntent = "PREP_QUERY";
-      toolCalled = "confirm_fasting_readiness";
-      const phoneMatch = userMessage.match(/\b\d{10}\b/);
+    // 1. Phone number provided
+    if (collectedPatientPhone && (lastAiText.toLowerCase().includes("mobile number") || lastAiText.toLowerCase().includes("phone"))) {
+      detectedIntent = "BOOKING";
+      toolCalled = "book_lab_appointment";
+      const targetTest = contextTestName || "Kidney Function Test (KFT/RFT)";
+      const targetSlot = lastOfferedSlots[0] || "09:00 AM";
+
       toolArgs = {
-        patient_phone: phoneMatch ? phoneMatch[0] : undefined,
-        patient_name: patientName !== "Patient" ? patientName : undefined,
+        patient_name: collectedPatientName || "Patient",
+        patient_phone: collectedPatientPhone,
+        test_name: targetTest,
+        date: dateStr,
+        time_slot: targetSlot,
       };
-      toolResult = await confirmFastingReadiness(toolArgs);
+      toolResult = await bookLabAppointment(toolArgs);
       aiResponse = toolResult.speechText;
     }
 
     // 2. User chose a slot
     else if (detectedSlot && (slotContextActive || userMessage.length < 20 || lower.includes("book") || lower.includes("slot"))) {
       detectedIntent = "BOOKING";
-      toolCalled = "book_lab_appointment";
-      const testToBook = testDetectedInMessage || contextTestName || "Fasting Blood Sugar (FBS)";
-      toolArgs = {
-        patient_name: patientName,
-        patient_phone: "+91 98200 " + Math.floor(10000 + Math.random() * 90000),
-        test_name: testToBook,
-        date: dateStr,
-        time_slot: detectedSlot,
-      };
-      toolResult = await bookLabAppointment(toolArgs);
-      aiResponse = toolResult.speechText;
+
+      if (!collectedPatientPhone) {
+        // Ask for phone number
+        if (collectedPatientName) {
+          aiResponse = `I have reserved ${detectedSlot} on ${dateStr} for your ${contextTestName || "test"}, ${collectedPatientName}. Could you please share your 10-digit mobile number so we can confirm the booking and send reminders?`;
+        } else {
+          aiResponse = `I have reserved ${detectedSlot} on ${dateStr}. Could you please share your full name and 10-digit mobile number to complete the booking?`;
+        }
+      } else {
+        toolCalled = "book_lab_appointment";
+        const testToBook = testDetectedInMessage || contextTestName || "Kidney Function Test (KFT/RFT)";
+        toolArgs = {
+          patient_name: collectedPatientName || "Patient",
+          patient_phone: collectedPatientPhone,
+          test_name: testToBook,
+          date: dateStr,
+          time_slot: detectedSlot,
+        };
+        toolResult = await bookLabAppointment(toolArgs);
+        aiResponse = toolResult.speechText;
+      }
     }
 
-    // 3. User mentioned a specific test (e.g., "vitamin D", "lipid profile test") without booking
+    // 3. User mentioned a specific test (e.g. "ki want a test for kidney", "vitamin D")
     else if (testDetectedInMessage && !lower.includes("book") && !lower.includes("slot")) {
       detectedIntent = "PREP_QUERY";
       toolCalled = "check_test_prep";
@@ -410,169 +487,38 @@ export async function POST(req: NextRequest) {
       aiResponse = toolResult.speechText;
     }
 
-    // 4. Affirmation ("yes", "sure", "ok", "confirm")
-    else if (
-      lower === "yes" ||
-      lower.startsWith("yes ") ||
-      lower.startsWith("sure") ||
-      lower.startsWith("ok") ||
-      lower.startsWith("okay") ||
-      lower.includes("confirm") ||
-      lower.includes("sounds good") ||
-      lower.includes("that works")
-    ) {
-      if (slotContextActive && lastOfferedSlots.length > 0) {
-        detectedIntent = "BOOKING";
-        toolCalled = "book_lab_appointment";
-        toolArgs = {
-          patient_name: patientName,
-          patient_phone: "+91 98200 " + Math.floor(10000 + Math.random() * 90000),
-          test_name: testDetectedInMessage || contextTestName || "Fasting Blood Sugar (FBS)",
-          date: dateStr,
-          time_slot: lastOfferedSlots[0],
-        };
-        toolResult = await bookLabAppointment(toolArgs);
-        aiResponse = toolResult.speechText;
-      } else if (lastAiText.toLowerCase().includes("fasting") || lower.includes("fasting")) {
-        detectedIntent = "PREP_QUERY";
-        toolCalled = "confirm_fasting_readiness";
-        toolArgs = { patient_name: patientName !== "Patient" ? patientName : undefined };
-        toolResult = await confirmFastingReadiness(toolArgs);
-        aiResponse = toolResult.speechText;
-      } else {
-        aiResponse = "Certainly! Would you like to check test guidelines or book an appointment?";
-      }
-    }
-
-    // 5. Explicit Booking Request
+    // 4. Booking intent
     else if (
       lower.includes("book") ||
       lower.includes("schedule") ||
       lower.includes("appointment") ||
-      lower.includes("reserve") ||
-      (lower.includes("want") && (lower.includes("test") || lower.includes("slot")))
+      lower.includes("reserve")
     ) {
       detectedIntent = "BOOKING";
       const targetTest = testDetectedInMessage || contextTestName;
 
-      if (targetTest && detectedSlot) {
+      if (targetTest && detectedSlot && collectedPatientPhone) {
         toolCalled = "book_lab_appointment";
         toolArgs = {
-          patient_name: patientName,
-          patient_phone: "+91 98200 " + Math.floor(10000 + Math.random() * 90000),
+          patient_name: collectedPatientName || "Patient",
+          patient_phone: collectedPatientPhone,
           test_name: targetTest,
           date: dateStr,
           time_slot: detectedSlot,
         };
         toolResult = await bookLabAppointment(toolArgs);
         aiResponse = toolResult.speechText;
-      } else if (targetTest && !detectedSlot) {
+      } else if (targetTest) {
         toolCalled = "get_available_slots";
         toolArgs = { date: dateStr };
         toolResult = await getAvailableSlots(dateStr);
-        aiResponse = `Certainly! For ${targetTest} on ${dateStr}, we have ${toolResult.data.recommended[0]} or ${toolResult.data.recommended[1]} available. Which suits you better?`;
+        aiResponse = `We have ${toolResult.data.recommended[0]} or ${toolResult.data.recommended[1]} available on ${toolResult.data.displayDate}. Which suits you better?`;
       } else {
         aiResponse = "I can certainly help you book an appointment. Which diagnostic test would you like to schedule?";
       }
     }
 
-    // 6. Slot / Timing inquiry
-    else if (
-      lower.includes("slot") ||
-      lower.includes("time") ||
-      lower.includes("available") ||
-      lower.includes("when can i") ||
-      lower.includes("timing") ||
-      lower.includes("morning") ||
-      lower.includes("afternoon")
-    ) {
-      detectedIntent = "BOOKING";
-      toolCalled = "get_available_slots";
-      toolArgs = { date: dateStr };
-      toolResult = await getAvailableSlots(dateStr);
-      aiResponse = toolResult.speechText;
-    }
-
-    // 7. General Prep / Fasting / Price Inquiry
-    else if (
-      lower.includes("prep") ||
-      lower.includes("fasting") ||
-      lower.includes("eat") ||
-      lower.includes("drink") ||
-      lower.includes("water") ||
-      lower.includes("tea") ||
-      lower.includes("coffee") ||
-      lower.includes("milk") ||
-      lower.includes("price") ||
-      lower.includes("cost") ||
-      lower.includes("charges") ||
-      lower.includes("rate") ||
-      lower.includes("how much") ||
-      lower.includes("rules") ||
-      lower.includes("instructions") ||
-      lower.includes("test")
-    ) {
-      detectedIntent = "PREP_QUERY";
-      toolCalled = "check_test_prep";
-      const targetTest = testDetectedInMessage || contextTestName || "Lipid Profile";
-      toolArgs = { test_name: targetTest };
-      toolResult = await checkTestPrep(targetTest);
-
-      if (toolResult.success) {
-        if (lower.includes("tea") || lower.includes("coffee") || lower.includes("milk")) {
-          if (toolResult.data.fastingRequired) {
-            aiResponse = `No, tea, coffee, and milk are strictly prohibited. ${toolResult.data.name} requires ${toolResult.data.fastingHours} hours of fasting with plain water only.`;
-          } else {
-            aiResponse = `Yes, tea or coffee is acceptable as no fasting is required for ${toolResult.data.name}.`;
-          }
-        } else if (lower.includes("water")) {
-          aiResponse = `Yes, plain water is allowed and encouraged during the fasting period for ${toolResult.data.name}.`;
-        } else {
-          aiResponse = toolResult.speechText;
-        }
-      } else {
-        aiResponse = toolResult.speechText;
-      }
-    }
-
-    // 8. Polite Gratitude / Closing
-    else if (
-      lower.includes("thank") ||
-      lower.includes("thx") ||
-      lower.includes("bye") ||
-      lower.includes("good night")
-    ) {
-      aiResponse = "You're very welcome! Please remember your fasting guidelines, and feel free to reach out if you need anything else. Have a healthy day!";
-    }
-
-    // 9. Negative response ("no", "cancel")
-    else if (lower === "no" || lower.startsWith("no ") || lower.includes("not now")) {
-      aiResponse = "No problem! Feel free to ask whenever you need test preparation details or wish to schedule an appointment.";
-    }
-
-    // 10. Greetings
-    else if (
-      lower === "hi" ||
-      lower.startsWith("hi ") ||
-      lower.startsWith("hello") ||
-      lower.startsWith("hey") ||
-      lower.includes("good morning") ||
-      lower.includes("good afternoon")
-    ) {
-      aiResponse = "Hello! This is Ananya from Apex Diagnostic Centre. I can help you check test fasting requirements, check available slots, or book an appointment. How can I assist you today?";
-    }
-
-    // 11. Contextual fallback
-    else if (conversationHistory.length > 0) {
-      const active = testDetectedInMessage || contextTestName;
-      if (active) {
-        aiResponse = `I'm here to assist with your ${active}. Would you like to check test instructions, view available slots, or book an appointment?`;
-      } else {
-        aiResponse = "I can help you check test preparation guidelines or book an appointment. Which diagnostic test are you interested in?";
-      }
-    }
-
-    // 12. Initial fallback
+    // 5. Fallback
     else {
       aiResponse = "Hello! This is Ananya from Apex Diagnostic Centre. How may I assist you with your lab tests or bookings today?";
     }

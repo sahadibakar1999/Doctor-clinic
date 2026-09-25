@@ -260,11 +260,13 @@ export async function bookLabAppointment(params: {
     };
   }
 
+  const formattedPhone = patient_phone ? patient_phone.trim() : "+91 98000 00000";
+
   // 3. Create appointment
   const appointment = await prisma.appointment.create({
     data: {
       patientName: patient_name.trim(),
-      patientPhone: patient_phone ? patient_phone.trim() : "+91 98000 00000",
+      patientPhone: formattedPhone,
       testId: labTest.id,
       date: bookingDate,
       timeSlot: normalizedSlot,
@@ -287,9 +289,9 @@ export async function bookLabAppointment(params: {
   let speech = "";
   if (labTest.fastingRequired && labTest.fastingHours > 0) {
     const cutoffTime = calculateFastingCutoff(normalizedSlot, labTest.fastingHours);
-    speech = `Your appointment for ${labTest.name} is confirmed for ${formattedDate} at ${normalizedSlot}. Please ensure you do not eat anything after ${cutoffTime}. Only plain water is allowed. See you tomorrow!`;
+    speech = `Your appointment for ${labTest.name} is confirmed for ${appointment.patientName} on ${formattedDate} at ${normalizedSlot}. Please ensure you do not eat anything after ${cutoffTime}. Only plain water is allowed. Confirmation details sent to ${appointment.patientPhone}!`;
   } else {
-    speech = `Your appointment for ${labTest.name} is confirmed for ${formattedDate} at ${normalizedSlot}. No fasting is required. We look forward to seeing you!`;
+    speech = `Your appointment for ${labTest.name} is confirmed for ${appointment.patientName} on ${formattedDate} at ${normalizedSlot}. No fasting is required. Confirmation details sent to ${appointment.patientPhone}!`;
   }
 
   // Record CallLog for this booking
