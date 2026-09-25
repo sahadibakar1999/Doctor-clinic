@@ -1,0 +1,49 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = "file:./dev.db"
+}
+
+model LabTest {
+  id               String        @id @default(cuid())
+  name             String
+  category         String        // e.g., "Blood Test", "Radiology", "Pathology", "Biochemistry"
+  price            Float         // in INR ₹
+  fastingRequired  Boolean       @default(false)
+  fastingHours     Int           @default(0) // e.g., 10 for Lipid Profile, 8 for FBS, 0 for HbA1c
+  prepInstructions String        // e.g., "10-12 hours overnight fasting. Water allowed. Avoid alcohol 24h prior."
+  sampleType       String        // e.g., "Blood", "Urine", "Scan", "Serum"
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+  appointments     Appointment[]
+}
+
+model Appointment {
+  id                  String   @id @default(cuid())
+  patientName         String
+  patientPhone        String
+  testId              String
+  test                LabTest  @relation(fields: [testId], references: [id], onDelete: Cascade)
+  date                DateTime
+  timeSlot            String   // e.g., "08:30 AM"
+  status              String   @default("CONFIRMED") // "CONFIRMED", "REMINDER_SENT", "COMPLETED", "CANCELLED", "NO_SHOW"
+  fastingAcknowledged Boolean  @default(false)
+  notes               String?
+  createdAt           DateTime @default(now())
+  updatedAt           DateTime @updatedAt
+}
+
+model CallLog {
+  id              String   @id @default(cuid())
+  callId          String   @unique
+  callerPhone     String
+  transcript      String?
+  summary         String
+  intent          String   // "BOOKING", "PREP_QUERY", "RESCHEDULE", "OTHER"
+  durationSeconds Int?     @default(45)
+  audioStatus     String?  @default("COMPLETED")
+  timestamp       DateTime @default(now())
+}
