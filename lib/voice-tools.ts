@@ -25,6 +25,21 @@ const DEFAULT_SLOTS = [
   "05:00 PM",
 ];
 
+export function normalizeTimeSlot(raw?: string): string {
+  if (!raw) return "08:30 AM";
+  const trimmed = raw.trim().toUpperCase();
+  const match = trimmed.match(/(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?/);
+  if (!match) return trimmed;
+  let hour = parseInt(match[1], 10);
+  const min = match[2] || "00";
+  let ampm = match[3];
+  if (!ampm) {
+    ampm = hour >= 7 && hour < 12 ? "AM" : "PM";
+  }
+  const hourStr = hour < 10 ? `0${hour}` : `${hour}`;
+  return `${hourStr}:${min} ${ampm}`;
+}
+
 // Helper to parse date strings like "tomorrow", "today", "2026-09-26"
 export function parseDateInput(dateInput?: string): Date {
   const now = new Date();
@@ -217,7 +232,7 @@ export async function bookLabAppointment(params: {
   const nextDay = new Date(bookingDate);
   nextDay.setDate(nextDay.getDate() + 1);
 
-  const normalizedSlot = time_slot?.trim() || "08:00 AM";
+  const normalizedSlot = normalizeTimeSlot(time_slot);
 
   // 2. Check collision
   const existing = await prisma.appointment.findFirst({
