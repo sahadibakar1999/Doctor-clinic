@@ -8,6 +8,8 @@ import {
   parseDateInput,
 } from "@/lib/voice-tools";
 
+export const dynamic = "force-dynamic";
+
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json();

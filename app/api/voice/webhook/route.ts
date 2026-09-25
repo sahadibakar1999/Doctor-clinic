@@ -7,6 +7,8 @@ import {
   ToolResult,
 } from "@/lib/voice-tools";
 
+export const dynamic = "force-dynamic";
+
 // Core dispatcher for tool execution
 async function executeTool(name: string, args: any): Promise<ToolResult> {
   const cleanName = (name || "").toLowerCase().replace(/-/g, "_");
